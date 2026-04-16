@@ -72,7 +72,8 @@
 #define FILE_LOG_SIZE   8192    /* At most 8K update for each file*/
 #define DIR_LOG_SIZE    1024    /* At most 1K entry for each dir */
 #define SHM_SIZE        (1UL << 30)  /* 1GB shared memory */
-#define DATA_DIR        "./data"     /* dir for storing object files */
+//#define DATA_DIR        "./data"     /* dir for storing object files */
+static char data_dir[512];
 
 /* ============================================================
  *  64-bit Update (core data for files)
@@ -213,8 +214,11 @@ static void ensure_object_file(void) {
     if (cur_obj_fd >= 0) return;
     char path[256];
     snprintf(path, sizeof(path), "%s/m%d.%05d",
-             DATA_DIR, machine_num, cur_obj_num);
+             data_dir, machine_num, cur_obj_num);
     cur_obj_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (cur_obj_fd < 0) {
+        fprintf(stderr, "ERROR: cannot open %s: %s\n", path, strerror(errno));
+    }
     cur_block_pos = 0;
 }
 
@@ -243,11 +247,36 @@ static uint32_t write_blocks(const char *buf, int nblocks,
 static int read_blocks(int host, int obj, int position, int nblocks,
                        char *buf) {
     char path[256];
-    snprintf(path, sizeof(path), "%s/m%d.%05d", DATA_DIR, host, obj);
+    snprintf(path, sizeof(path), "%s/m%d.%05d", data_dir, host, obj);
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -errno;
     pread(fd, buf, nblocks * BLOCK_SIZE, position * BLOCK_SIZE);
     close(fd);
+    return 0;
+}
+
+/* ============================================================
+ *  Helper Method: separate the parent path and file/dir name from path
+ * ============================================================ */
+static int split_path(const char *path, char *parent_path,
+                      size_t parent_size, char *name, size_t name_size) {
+    char tmp[256];
+    strncpy(tmp, path, sizeof(tmp));
+    tmp[sizeof(tmp)-1] = '\0';
+
+    char *last_slash = strrchr(tmp, '/');
+    if (!last_slash) return -EINVAL;
+
+    strncpy(name, last_slash + 1, name_size);
+    name[name_size - 1] = '\0';
+
+    if (last_slash == tmp) {
+        strcpy(parent_path, "/");
+    } else {
+        *last_slash = '\0';
+        strncpy(parent_path, tmp, parent_size);
+        parent_path[parent_size - 1] = '\0';
+    }
     return 0;
 }
 
@@ -348,7 +377,7 @@ static int dir_append(struct dir_inode *dir, struct dir_entry *entry) {
             /* full memory barrier, global visible */
             __sync_synchronize();
             /* atomically, publish the entry */
-            if (cas64((uint64_t*)&dir->entries[i].type,
+            if (__sync_bool_compare_and_swap(&dir->entries[i].type,
                       ENTRY_EMPTY, entry->type))
                 return 0;
         }
@@ -400,7 +429,8 @@ static void* resolve_path(const char *path, int *is_dir) {
  * ============================================================ */
 
 /* getattr: get the stat of file/dir */
-static int rdmafs_getattr(const char *path, struct stat *st) {
+static int rdmafs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
+    (void)fi;
     memset(st, 0, sizeof(*st));
 
     int is_dir = 0;
@@ -419,8 +449,9 @@ static int rdmafs_getattr(const char *path, struct stat *st) {
         st->st_nlink = 1;
         st->st_uid = f->uid;
         st->st_gid = f->gid;
-        /* TODO: scan f->log, calculate the size of file */
-        st->st_size = 0; /* temporal */
+        /* scan f->log, calculate the size of file */
+        struct block_location bmap[16384];
+        st->st_size = resolve_file_blocks(f, bmap, 16384);
     }
     return 0;
 }
@@ -428,8 +459,7 @@ static int rdmafs_getattr(const char *path, struct stat *st) {
 /* readdir: list the content in a dir */
 static int rdmafs_readdir(const char *path, void *buf,
                           fuse_fill_dir_t filler,
-                          off_t offset, struct fuse_file_info *fi,
-			  enum fuse_readdir_flags flags) {
+                          off_t offset, struct fuse_file_info *fi) {
     int is_dir = 0;
     void *node = resolve_path(path, &is_dir);
     if (!node || !is_dir) return -ENOENT;
@@ -442,9 +472,26 @@ static int rdmafs_readdir(const char *path, void *buf,
      * (Need to deduplicate: the last entry with the same name wins, even if TOMBSTONE)
      */
     /* TODO: call filler(buf, name, NULL, 0) for every valid entry*/
+    char seen_names[DIR_LOG_SIZE][MAX_NAME_LEN];
+    int seen_count = 0;
     for(int i=0; i < DIR_LOG_SIZE; i++) {
-        if (dir->entries[i].type == ENTRY_EMPTY || dir->entries[i].type == ENTRY_TOMBSTONE) {continue;}
-        filler(buf, dir->entries[i].name, NULL, 0, 0);
+        if (dir->entries[i].type == ENTRY_EMPTY) {break;} // || dir->entries[i].type == ENTRY_TOMBSTONE
+        char * temp_name = dir->entries[i].name;
+        int if_seen = 0;
+        for(int j=0; j < seen_count; j++){
+            if(strncmp(seen_names[j], temp_name, MAX_NAME_LEN) == 0){
+                if_seen = 1;
+                break;
+            }
+        }
+        if(if_seen) continue;
+        strncpy(seen_names[seen_count], temp_name, MAX_NAME_LEN);
+        seen_count++;
+
+        struct dir_entry *winner = dir_lookup(dir, temp_name);
+        if(winner) {
+            filler(buf, temp_name, NULL, 0, 0);
+        }
     }
 
     return 0;
@@ -454,24 +501,57 @@ static int rdmafs_readdir(const char *path, void *buf,
 static int rdmafs_create(const char *path, mode_t mode,
                          struct fuse_file_info *fi) {
     /* TODO */
+    // separate the parent dir and the file
+    char temp_path[256];
+    strncpy(temp_path, path, sizeof(temp_path));
+    temp_path[sizeof(temp_path)-1] = '\0';
 
-    // char temp_path[4096];
-    // strncpy(temp_path, path, sizeof(temp_path)-1);
-    // char *saveptr;
-    // char *component = strtok_r(temp_path, "/", &saveptr);
-    // while (component) {
+    char *last_slash = strrchr(temp_path, '/');
+    if(!last_slash) return -EINVAL;
 
-    // }
-    // struct dir_entry *e = dir_lookup(path)
+    char filename[MAX_NAME_LEN];
+    strncpy(filename, last_slash+1, MAX_NAME_LEN);
+    filename[MAX_NAME_LEN-1] = '\0';
+
+    // parent dir
+    char parent_path[256];
+    if(last_slash == temp_path){
+        strcpy(parent_path, "/");
+    }else {
+        *last_slash = '\0';
+        strcpy(parent_path, temp_path);
+    }
+
+    // find the parent dir
     int is_dir = 0;
-    void* temp = resolve_path(path, &is_dir);
+    void* temp = resolve_path(parent_path, &is_dir);
     if(NULL == temp || !is_dir){
         return -ENOENT;
     }
     struct dir_inode *parent = (struct dir_inode *) temp;
-    shm_alloc(BLOCK_SIZE);
-    dir_append(parent, (struct dir_entry *)fi->fh);
-    return 0;
+    // allocate file node
+    uint64_t offset = shm_alloc(sizeof(struct file_inode));
+    if(offset == (uint64_t)-1) return -ENOSPC;
+
+    // initialization, shared memory is 0 though, set up the props
+    struct file_inode *fi_node = (struct file_inode *)((char *)shm_base + offset);
+    memset(fi_node, 0, sizeof(struct file_inode));
+    fi_node->mode = mode & 0777;
+    fi_node->uid = getuid();
+    fi_node->gid = getgid();
+    fi_node->ctime = time(NULL);
+
+    // append
+    struct dir_entry temp_entry;
+    memset(&temp_entry, 0, sizeof(temp_entry));
+    temp_entry.type = ENTRY_FILE;
+    strncpy(temp_entry.name, filename, MAX_NAME_LEN);
+    temp_entry.inode_offset = offset;
+    temp_entry.uid = fi_node->uid;
+    temp_entry.gid = fi_node->gid;
+    temp_entry.mode = fi_node->mode;
+    temp_entry.ctime = fi_node->ctime;
+    return dir_append(parent, &temp_entry);
 }
 
 /* write: write to a new file */
@@ -591,25 +671,110 @@ static int rdmafs_read(const char *path, char *buf, size_t len,
 
 /* mkdir */
 static int rdmafs_mkdir(const char *path, mode_t mode) {
+    char parent_path[256], dirname[MAX_NAME_LEN];
+    if (split_path(path, parent_path, sizeof(parent_path),
+                   dirname, sizeof(dirname)) != 0)
+        return -EINVAL;
 
-    /* TODO */
+    int is_dir = 0;
+    void *parent = resolve_path(parent_path, &is_dir);
+    if (!parent || !is_dir) return -ENOENT;
+    struct dir_inode *pdir = (struct dir_inode *)parent;
 
-    return 0;
+    if (dir_lookup(pdir, dirname) != NULL) return -EEXIST;
+
+    uint64_t offset = shm_alloc(sizeof(struct dir_inode));
+    if (offset == (uint64_t)-1) return -ENOSPC;
+
+    struct dir_inode *new_dir = (struct dir_inode *)((char *)shm_base + offset);
+    memset(new_dir, 0, sizeof(struct dir_inode));
+    new_dir->mode = mode & 0777;
+    new_dir->uid = getuid();
+    new_dir->gid = getgid();
+    new_dir->ctime = time(NULL);
+
+    struct dir_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.type = ENTRY_DIR;
+    strncpy(entry.name, dirname, MAX_NAME_LEN);
+    entry.inode_offset = offset;
+    entry.uid = new_dir->uid;
+    entry.gid = new_dir->gid;
+    entry.mode = new_dir->mode;
+    entry.ctime = new_dir->ctime;
+
+    return dir_append(pdir, &entry);
 }
 
 /* unlink : remove a single file */
 static int rdmafs_unlink(const char *path) {
+    char parent_path[256], filename[MAX_NAME_LEN];
+    if (split_path(path, parent_path, sizeof(parent_path),
+                   filename, sizeof(filename)) != 0)
+        return -EINVAL;
 
-    /* TODO */
+    int is_dir = 0;
+    void *parent = resolve_path(parent_path, &is_dir);
+    if (!parent || !is_dir) return -ENOENT;
+    struct dir_inode *pdir = (struct dir_inode *)parent;
 
-    return 0;
+    struct dir_entry *existing = dir_lookup(pdir, filename);
+    if (!existing) return -ENOENT;
+    if (existing->type != ENTRY_FILE) return -EISDIR;
+
+    struct dir_entry tombstone;
+    memset(&tombstone, 0, sizeof(tombstone));
+    tombstone.type = ENTRY_TOMBSTONE;
+    strncpy(tombstone.name, filename, MAX_NAME_LEN);
+
+    return dir_append(pdir, &tombstone);
 }
 
 /* rmdir : remove empty directories */
 static int rdmafs_rmdir(const char *path) {
+    char parent_path[256], dirname[MAX_NAME_LEN];
+    if (split_path(path, parent_path, sizeof(parent_path),
+                   dirname, sizeof(dirname)) != 0)
+        return -EINVAL;
 
-    /* TODO */
+    int is_dir = 0;
+    void *parent = resolve_path(parent_path, &is_dir);
+    if (!parent || !is_dir) return -ENOENT;
+    struct dir_inode *pdir = (struct dir_inode *)parent;
 
+    struct dir_entry *existing = dir_lookup(pdir, dirname);
+    if (!existing) return -ENOENT;
+    if (existing->type != ENTRY_DIR) return -ENOTDIR;
+
+    struct dir_inode *target = (struct dir_inode *)((char *)shm_base + existing->inode_offset);
+    for (int i = 0; i < DIR_LOG_SIZE; i++) {
+        if (target->entries[i].type == ENTRY_EMPTY) break;
+        if (target->entries[i].type == ENTRY_FILE ||
+            target->entries[i].type == ENTRY_DIR) {
+            if (dir_lookup(target, target->entries[i].name) != NULL)
+                return -ENOTEMPTY;
+        }
+    }
+
+    struct dir_entry tombstone;
+    memset(&tombstone, 0, sizeof(tombstone));
+    tombstone.type = ENTRY_TOMBSTONE;
+    strncpy(tombstone.name, dirname, MAX_NAME_LEN);
+
+    return dir_append(pdir, &tombstone);
+}
+
+/* utimes : set the timestamp */
+static int rdmafs_utimens(const char *path, const struct timespec tv[2],
+                          struct fuse_file_info *fi) {
+    (void)path; (void)tv; (void)fi;
+    return 0;
+}
+
+/* truncate : truncate the file */
+static int rdmafs_truncate(const char *path, off_t size,
+                           struct fuse_file_info *fi) {
+    (void)path; (void)size; (void)fi;
     return 0;
 }
 
@@ -622,11 +787,11 @@ static struct fuse_operations fs_ops = {
     .create  = rdmafs_create,
     .write   = rdmafs_write,
     .read    = rdmafs_read,
-    /* TODO: mkdir, unlink, rmdir, truncate, etc. */
     .mkdir   = rdmafs_mkdir,
     .unlink  = rdmafs_unlink,
-    .rmdir   = rdmafs_rmdir
-    //.truncate = rdmafs_truncate
+    .rmdir   = rdmafs_rmdir,
+    .utimens  = rdmafs_utimens,
+    .truncate = rdmafs_truncate
 };
 
 static struct fuse_opt opts[] = {
@@ -640,11 +805,14 @@ int main(int argc, char **argv) {
         exit(1);
 
     /* create the dir of data */
-    mkdir(DATA_DIR, 0755);
+    mkdir("./data", 0755);
+    realpath("./data", data_dir);
+    printf("Data dir: %s\n", data_dir);
 
     /* open shared memory */
     int fd = shm_open("/rdmafs", O_RDWR | O_CREAT, 0600);
     ftruncate(fd, SHM_SIZE);
+    
     shm_base = mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE,
                     MAP_SHARED, fd, 0);
     close(fd);
