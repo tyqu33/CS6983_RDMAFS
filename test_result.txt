@@ -1,0 +1,55 @@
+=== Pre-check ===
+  Both mount points accessible.
+
+=== Test 1: Basic create and read ===
+  PASS: write and read back
+=== Test 2: Multiple files ===
+  PASS: read a.txt
+  PASS: read b.txt
+  PASS: read c.txt
+  PASS: ls shows a.txt
+  PASS: ls shows b.txt
+  PASS: ls shows c.txt
+=== Test 3: Overwrite ===
+  PASS: before overwrite
+  PASS: after overwrite
+=== Test 4: Subdirectory ===
+  PASS: read nested file
+  PASS: ls subdir
+=== Test 5: Nested subdirectories ===
+  PASS: read 2-level nested file
+=== Test 6: Delete file (unlink) ===
+  PASS: file exists before delete
+  PASS: file gone after delete
+=== Test 7: Delete empty directory (rmdir) ===
+  PASS: dir exists
+  PASS: dir removed
+=== Test 8: Cross-machine read (machine 0 writes, machine 1 reads) ===
+  PASS: machine 1 reads machine 0's file
+  PASS: machine 1 sees test1.txt
+  PASS: machine 1 sees a.txt
+=== Test 9: Cross-machine write (machine 1 writes, machine 0 reads) ===
+  PASS: machine 0 reads machine 1's file
+=== Test 10: Both machines see same directory listing ===
+  PASS: directory listings match
+=== Test 11: Cross-machine subdirectory access ===
+  PASS: machine 1 reads machine 0's subdirectory file
+=== Test 12: Larger write (multi-block) ===
+  PASS: 10KB file write and read
+=== Test 13: Cross-machine large file ===
+  PASS: machine 1 reads 10KB file from machine 0
+=== Test 14: File size correctness ===
+  PASS: file size is 20 bytes
+=== Test 15: Empty file ===
+  PASS: empty file size is 0
+  PASS: empty file reads empty
+=== Test 16: Machine 1 deletes, machine 0 sees it ===
+  PASS: machine 0 sees file before delete
+  PASS: machine 0 sees file removed
+
+======================================
+  PASSED: 29
+  FAILED: 0
+  TOTAL:  29
+======================================
+  ALL TESTS PASSED!

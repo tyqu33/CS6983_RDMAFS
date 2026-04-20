@@ -63,6 +63,7 @@
 #include <fcntl.h>
 #include <fuse.h>
 #include <time.h>
+#include <pthread.h>
 
 /* ============================================================
  *  Constant
@@ -73,7 +74,9 @@
 #define DIR_LOG_SIZE    1024    /* At most 1K entry for each dir */
 #define SHM_SIZE        (1UL << 30)  /* 1GB shared memory */
 //#define DATA_DIR        "./data"     /* dir for storing object files */
+#define MAX_FILE_BLOCKS 16384
 static char data_dir[512];
+static pthread_mutex_t obj_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ============================================================
  *  64-bit Update (core data for files)
@@ -211,24 +214,42 @@ static uint64_t shm_alloc(size_t size) {
  *  If current object is too big, have a new one
  */
 static void ensure_object_file(void) {
-    if (cur_obj_fd >= 0) return;
-    char path[256];
-    snprintf(path, sizeof(path), "%s/m%d.%05d",
-             data_dir, machine_num, cur_obj_num);
-    cur_obj_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (cur_obj_fd < 0) {
-        fprintf(stderr, "ERROR: cannot open %s: %s\n", path, strerror(errno));
+        char path[256];
+        snprintf(path, sizeof(path), "%s/m%d.%05d",
+                data_dir, machine_num, cur_obj_num);
+        cur_obj_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (cur_obj_fd < 0) {
+            fprintf(stderr, "ERROR: cannot open %s: %s\n", path, strerror(errno));
+            cur_block_pos = 0;
+            return;
+        }
     }
-    cur_block_pos = 0;
+    struct stat st;
+    if(fstat(cur_obj_fd, &st) == 0) {
+        cur_block_pos = st.st_size / BLOCK_SIZE; // use the acutal size to calculate the pos of block
+    }
 }
 
 /* Write nblocks(#) of blocks, return the start of block position */
 static uint32_t write_blocks(const char *buf, int nblocks,
                              int *out_obj) {
+    pthread_mutex_lock(&obj_mutex);
     ensure_object_file();
     uint32_t start_pos = cur_block_pos;
-    write(cur_obj_fd, buf, nblocks * BLOCK_SIZE);
-    cur_block_pos += nblocks;
+    size_t total = (size_t)nblocks * BLOCK_SIZE;
+    size_t done  = 0;
+    /* write() can short-write; loop until all bytes are out. */
+    while(done < total) {
+        ssize_t n = write(cur_obj_fd, buf + done, total - done);
+        if (n <= 0) {
+            fprintf(stderr, "write_blocks: write() failed at %zu/%zu (%s)\n", done, total, strerror(errno));
+            break;
+        }
+        done += (size_t)n;
+    }
+    fsync(cur_obj_fd); // make sure data flushes to disk
+    cur_block_pos += (uint32_t)(done / BLOCK_SIZE); // Move forward by however many full blocks actually landed
     *out_obj = cur_obj_num;
 
     /* If object is too big, (> 4096 blocks), have a new one */
@@ -238,6 +259,7 @@ static uint32_t write_blocks(const char *buf, int nblocks,
         cur_obj_num++;
         cur_block_pos = 0;
     }
+    pthread_mutex_unlock(&obj_mutex);
     return start_pos;
 }
 
@@ -250,9 +272,11 @@ static int read_blocks(int host, int obj, int position, int nblocks,
     snprintf(path, sizeof(path), "%s/m%d.%05d", data_dir, host, obj);
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -errno;
-    pread(fd, buf, nblocks * BLOCK_SIZE, position * BLOCK_SIZE);
+    ssize_t n = pread(fd, buf, (size_t)nblocks * BLOCK_SIZE, (off_t)position * BLOCK_SIZE);
+    int saved_errno = errno;
     close(fd);
-    return 0;
+    if (n < 0) return -saved_errno;
+    return (int)n;
 }
 
 /* ============================================================
@@ -271,7 +295,8 @@ static int split_path(const char *path, char *parent_path,
     name[name_size - 1] = '\0';
 
     if (last_slash == tmp) {
-        strcpy(parent_path, "/");
+        strncpy(parent_path, "/", parent_size);
+        parent_path[parent_size - 1] = '\0';
     } else {
         *last_slash = '\0';
         strncpy(parent_path, tmp, parent_size);
@@ -316,22 +341,26 @@ static int append_update(struct file_inode *fi, union update upd) {
     int max_block = -1;
     int invalid_last_block = 0;
     for (int i = 0; i < FILE_LOG_SIZE; i++) {
-        if (fi->log[i].val != 0) {
-            struct _update u = fi->log[i].s;
-            for (int b = 0; b < u.len; b++) {
-                int foff = u.file_offset + b; // how many blocks away from the start of the file (logically)
-                if (foff >= bmap_size) continue;
-                bmap[foff].host = u.host;
-                bmap[foff].obj = u.obj;
-                bmap[foff].position = u.position + b;
-                bmap[foff].valid = 1;
-                
-                if(foff > max_block) {
-                    max_block = foff;
-                    invalid_last_block = u.invalid;
-                }
+        if (fi->log[i].val == 0) continue;
+        struct _update u = fi->log[i].s;
+        for (int b = 0; b < (int)u.len; b++) {
+            int foff = u.file_offset + b; // how many blocks away from the start of the file (logically)
+            if (foff < 0 || foff >= bmap_size) continue;
+            bmap[foff].host = u.host;
+            bmap[foff].obj = u.obj;
+            bmap[foff].position = u.position + b;
+            bmap[foff].valid = 1;
+            
+            /* u.invalid only describes the LAST block of this update */
+            int is_last_in_update = (b == (int)u.len - 1);
+            if(foff > max_block) {
+                max_block = foff;
+                invalid_last_block = is_last_in_update ? (int)u.invalid : 0;
+            } else if (foff == max_block && is_last_in_update) {
+                invalid_last_block = (int)u.invalid; // Latest update at the same max position wins for invalid
             }
         }
+        
     }
     if(max_block < 0) return 0;
     return (max_block+1) * BLOCK_SIZE - invalid_last_block;
@@ -450,8 +479,8 @@ static int rdmafs_getattr(const char *path, struct stat *st, struct fuse_file_in
         st->st_uid = f->uid;
         st->st_gid = f->gid;
         /* scan f->log, calculate the size of file */
-        struct block_location bmap[16384];
-        st->st_size = resolve_file_blocks(f, bmap, 16384);
+        struct block_location bmap[MAX_FILE_BLOCKS];
+        st->st_size = resolve_file_blocks(f, bmap, MAX_FILE_BLOCKS);
     }
     return 0;
 }
@@ -460,6 +489,7 @@ static int rdmafs_getattr(const char *path, struct stat *st, struct fuse_file_in
 static int rdmafs_readdir(const char *path, void *buf,
                           fuse_fill_dir_t filler,
                           off_t offset, struct fuse_file_info *fi) {
+    (void)offset; (void)fi;
     int is_dir = 0;
     void *node = resolve_path(path, &is_dir);
     if (!node || !is_dir) return -ENOENT;
@@ -471,26 +501,24 @@ static int rdmafs_readdir(const char *path, void *buf,
     /* scan log, construct the valid entry set for current dir
      * (Need to deduplicate: the last entry with the same name wins, even if TOMBSTONE)
      */
-    /* TODO: call filler(buf, name, NULL, 0) for every valid entry*/
-    char seen_names[DIR_LOG_SIZE][MAX_NAME_LEN];
-    int seen_count = 0;
     for(int i=0; i < DIR_LOG_SIZE; i++) {
-        if (dir->entries[i].type == ENTRY_EMPTY) {break;} // || dir->entries[i].type == ENTRY_TOMBSTONE
-        char * temp_name = dir->entries[i].name;
-        int if_seen = 0;
-        for(int j=0; j < seen_count; j++){
-            if(strncmp(seen_names[j], temp_name, MAX_NAME_LEN) == 0){
-                if_seen = 1;
-                break;
-            }
-        }
-        if(if_seen) continue;
-        strncpy(seen_names[seen_count], temp_name, MAX_NAME_LEN);
-        seen_count++;
+        if (dir->entries[i].type == ENTRY_EMPTY) {break;}
+        if (dir->entries[i].type == ENTRY_TOMBSTONE) {continue;}
+        // char * temp_name = dir->entries[i].name;
+        // int if_seen = 0;
+        // for(int j=0; j < seen_count; j++){
+        //     if(strncmp(seen_names[j], temp_name, MAX_NAME_LEN) == 0){
+        //         if_seen = 1;
+        //         break;
+        //     }
+        // }
+        // if(if_seen) continue;
+        // strncpy(seen_names[seen_count], temp_name, MAX_NAME_LEN);
+        // seen_count++;
 
-        struct dir_entry *winner = dir_lookup(dir, temp_name);
-        if(winner) {
-            filler(buf, temp_name, NULL, 0, 0);
+        struct dir_entry *winner = dir_lookup(dir, dir->entries[i].name);
+        if(winner == &dir->entries[i]) {
+            filler(buf, dir->entries[i].name, NULL, 0, 0);
         }
     }
 
@@ -502,6 +530,7 @@ static int rdmafs_create(const char *path, mode_t mode,
                          struct fuse_file_info *fi) {
     /* TODO */
     // separate the parent dir and the file
+    (void)fi;
     char temp_path[256];
     strncpy(temp_path, path, sizeof(temp_path));
     temp_path[sizeof(temp_path)-1] = '\0';
@@ -596,11 +625,42 @@ static int rdmafs_write(const char *path, const char *buf,
 
     char *aligned_buf = calloc(nblocks, BLOCK_SIZE);
 
-    if(offset % BLOCK_SIZE != 0 || len % BLOCK_SIZE != 0) {
+    int buf_offset = offset % BLOCK_SIZE;
+    int head_unaligned = (buf_offset != 0);
+    int tail_unaligned = ((offset + len) % BLOCK_SIZE != 0);
 
+    /* Read-modify-write: when the first or last block is only partially
+     * touched by this write, we must preserve the bytes outside the
+     * touched range. Otherwise the new on-disk block reads as zeros where
+     * old data should still live (e.g. Python's print() emits the trailing
+     * '\n' as a separate 1-byte write that would otherwise wipe out the
+     * preceding A's in the same block). */
+    if (head_unaligned || tail_unaligned) {
+        struct block_location bmap[MAX_FILE_BLOCKS];
+        (void)resolve_file_blocks(fnode, bmap, MAX_FILE_BLOCKS);
+
+        if (head_unaligned && first_block < MAX_FILE_BLOCKS
+            && bmap[first_block].valid) {
+            char tmp[BLOCK_SIZE];
+            memset(tmp, 0, BLOCK_SIZE);
+            read_blocks(bmap[first_block].host, bmap[first_block].obj,
+                        bmap[first_block].position, 1, tmp);
+            /* Preserve [0, buf_offset) of the original first block. */
+            memcpy(aligned_buf, tmp, buf_offset);
+        }
+        if (tail_unaligned && last_block < MAX_FILE_BLOCKS
+            && bmap[last_block].valid) {
+            char tmp[BLOCK_SIZE];
+            memset(tmp, 0, BLOCK_SIZE);
+            read_blocks(bmap[last_block].host, bmap[last_block].obj,
+                        bmap[last_block].position, 1, tmp);
+            int tail_off = (offset + len) % BLOCK_SIZE;
+            int dst_off  = (last_block - first_block) * BLOCK_SIZE + tail_off;
+            /* Preserve [tail_off, BLOCK_SIZE) of the original last block. */
+            memcpy(aligned_buf + dst_off, tmp + tail_off, BLOCK_SIZE - tail_off);
+        }
     }
 
-    int buf_offset = offset % BLOCK_SIZE;
     memcpy(aligned_buf + buf_offset, buf, len);
     int obj_num = 1;
     uint32_t start_pos = write_blocks(aligned_buf, nblocks, &obj_num);
@@ -639,12 +699,12 @@ static int rdmafs_read(const char *path, char *buf, size_t len,
     }
     struct file_inode *fnode = (struct file_inode *) temp;
 
-    struct block_location bmap[16384];
-    int file_size = resolve_file_blocks(fnode, bmap, 16384);
+    struct block_location bmap[MAX_FILE_BLOCKS];
+    int file_size = resolve_file_blocks(fnode, bmap, MAX_FILE_BLOCKS);
 
     // crop the range of reading
     if(offset >= file_size) return 0;
-    if(offset + len > file_size) len = file_size - offset;
+    if((off_t)(offset + len) > (off_t)file_size) len = (size_t)(file_size - offset);
 
     // read block by block
     int bytes_read = 0;
@@ -655,14 +715,23 @@ static int rdmafs_read(const char *path, char *buf, size_t len,
         if (to_read > (int)len - bytes_read)
             {to_read = (int)len - bytes_read;}
         
-        char temp[BLOCK_SIZE];
-        if (bmap[fblock].valid) {
-            read_blocks(bmap[fblock].host, bmap[fblock].obj,
-                       bmap[fblock].position, 1, temp);
-        } else {
-            memset(temp, 0, BLOCK_SIZE);
+        char temp_block[BLOCK_SIZE];
+        memset(temp_block, 0, BLOCK_SIZE);
+        if (fblock < MAX_FILE_BLOCKS && bmap[fblock].valid) {
+            int n = read_blocks(bmap[fblock].host, bmap[fblock].obj,
+                       bmap[fblock].position, 1, temp_block);
+            if(n < 0) {
+                fprintf(stderr, "rdmafs_read: read_blocks failed on %s fblock=%d host=%d obj=%d pos=%d (%s)\n",
+                        path, fblock, bmap[fblock].host, bmap[fblock].obj,
+                        bmap[fblock].position, strerror(-n));
+            } else if (n < BLOCK_SIZE && block_off + to_read > n) {
+                /* Source object file is shorter than the recorded */
+                fprintf(stderr, "rdmafs_read: SHORT READ on %s fblock=%d host=%d obj=%d pos=%d got=%d need=%d\n",
+                        path, fblock, bmap[fblock].host, bmap[fblock].obj,
+                        bmap[fblock].position, n, block_off + to_read);
+            }
         }
-        memcpy(buf + bytes_read, temp + block_off, to_read);
+        memcpy(buf + bytes_read, temp_block + block_off, to_read);
         bytes_read += to_read;
     }
 
@@ -778,6 +847,15 @@ static int rdmafs_truncate(const char *path, off_t size,
     return 0;
 }
 
+/* open: formid cache when opening files */
+static int rdmafs_open(const char *path, struct fuse_file_info *fi) {
+    int is_dir = 0;
+    void *node = resolve_path(path, &is_dir);
+    if (!node || is_dir) return -ENOENT;
+    fi->direct_io = 1;
+    return 0;
+}
+
 /* ============================================================
  *  FUSE ops & main
  * ============================================================ */
@@ -791,7 +869,8 @@ static struct fuse_operations fs_ops = {
     .unlink  = rdmafs_unlink,
     .rmdir   = rdmafs_rmdir,
     .utimens  = rdmafs_utimens,
-    .truncate = rdmafs_truncate
+    .truncate = rdmafs_truncate,
+    .open     = rdmafs_open
 };
 
 static struct fuse_opt opts[] = {
@@ -832,7 +911,6 @@ int main(int argc, char **argv) {
     }
 
     printf("Machine %d: starting FUSE\n", machine_num);
-
     /*
      * Use:
      *   mkdir -p /tmp/mnt0 /tmp/mnt1
