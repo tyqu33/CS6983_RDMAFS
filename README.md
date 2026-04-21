@@ -42,7 +42,37 @@
       gcc -Wall -o rdmafs rdmafs.c $(pkg-config --cflags --libs fuse3) -lpthread -lrt
       ```
 
-# 5. Initial Manual Testing
+# 5. Design Overview
+
+The RDMA-FS proof-of-concept implements a distributed file system where multiple independent FUSE server processes share a single logical file system. Each process represents a separate "machine" (numbered 0–3), mounts its own directory (e.g., /tmp/mnt0, /tmp/mnt1), and serves file system requests from user applications. All machines see the same files and directories because they share two key resources: a POSIX shared memory segment for metadata, and a set of local data files for block storage.
+
+```text
+User Applications (ls, cat, echo, cp, ...)
+       |                    |
+    /tmp/mnt0            /tmp/mnt1
+       |                    |
+ +-----------+        +-----------+
+ | FUSE      |        | FUSE      |
+ | Machine 0 |        | Machine 1 |
+ +-----------+        +-----------+
+       |    \              /    |
+       |     \            /     |
+       |   +----------------+   |
+       |   | Shared Memory  |   |
+       |   | (1GB, /dev/shm)|   |
+       |   | - root dir     |   |
+       |   | - file inodes  |   |
+       |   | - dir inodes   |   |
+       |   +----------------+   |
+       |                        |
+ +----------+           +----------+
+ | m0.00001 |           | m1.00001 |
+ | m0.00002 |           | m1.00002 |
+ | (data)   |           | (data)   |
+ +----------+           +----------+
+```
+
+# 6. Initial Manual Testing
    1) First create 2 mount directories. Note that the mount needs to be in the original Linux dir, don't put it in `/mnt/d`:
       ```bash
       mkdir -p /tmp/mnt0 /tmp/mnt1
@@ -135,7 +165,7 @@
         - Ops in `/tmp/mnt0/` -> calls to machine 0 on terminal 1.
         - Ops in `/tmp/mnt1/` -> calls to machine 1 on terminal 2.
 
-# 6. Multi-step Testings
+# 7. Multi-step Testings
    1) Multi-file and overwrite in terminal 3
       ```bash
       echo "aaa" > /tmp/mnt0/a.txt
@@ -176,7 +206,7 @@
       cat /tmp/mnt0/m1file.txt # should see from machine 1
       ```
 
-# 7. Automated test scripts
+# 8. Automated test scripts
 If step 5. and 6. have been run, clear up before running 7.
 Shut down mnt0 in terminal 1 and mnt1 in terminal 2, then run:
 ```bash
